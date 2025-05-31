@@ -1,0 +1,19 @@
+{
+  "name": "kacls-service",
+  "version": "1.0.0",
+  "description": "Key Access Control Layer Service",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "jsonwebtoken": "^9.0.2",
+    "redis": "^4.6.5",
+    "dotenv": "^16.3.1",
+    "axios": "^1.4.0",
+    "node-cache": "^5.1.2"
+  }
+}

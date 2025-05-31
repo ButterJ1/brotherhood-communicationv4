@@ -1,0 +1,226 @@
+networks:
+  secure_chat_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+services:
+  # PostgreSQL 資料庫
+  postgres:
+    image: postgres:15-alpine
+    container_name: secure_chat_postgres
+    environment:
+      POSTGRES_DB: secure_chat_auth
+      POSTGRES_USER: auth_user
+      POSTGRES_PASSWORD: auth_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.10
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth_user -d secure_chat_auth"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Redis (會話管理和快取)
+  redis:
+    image: redis:7-alpine
+    container_name: secure_chat_redis
+    command: redis-server --appendonly yes --requirepass redis_password
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6380:6379"  # 改用 6380 端口避免衝突
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.11
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 身分驗證服務
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    container_name: secure_chat_auth
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secure_chat_auth
+      DB_USER: auth_user
+      DB_PASSWORD: auth_password
+      REDIS_HOST: redis
+      REDIS_PORT: 6380
+      REDIS_PASSWORD: redis_password
+      JWT_EXPIRES_IN: 24h
+      ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000
+    volumes:
+      - ./auth-service:/app
+      - /app/node_modules
+      - ./shared:/app/shared
+    ports:
+      - "3001:3001"
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 金鑰管理服務 (KACLS)
+  kacls-service:
+    build:
+      context: ./kacls-service
+      dockerfile: Dockerfile
+    container_name: secure_chat_kacls
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      MASTER_KEY_PATH: /app/keys/master.key
+      AUTH_SERVICE_URL: http://auth-service:3001
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redis_password
+      ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000
+    volumes:
+      - ./kacls-service:/app
+      - /app/node_modules
+      - kacls_keys:/app/keys
+      - ./shared:/app/shared
+    ports:
+      - "3002:3002"
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.21
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 訊息儲存服務
+  message-service:
+    build:
+      context: ./message-service
+      dockerfile: Dockerfile
+    container_name: secure_chat_messages
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: secure_chat_messages
+      DB_USER: message_user
+      DB_PASSWORD: message_password
+      AUTH_SERVICE_URL: http://auth-service:3001
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: redis_password
+      ALLOWED_ORIGINS: http://localhost:8080,http://localhost:3000
+    volumes:
+      - ./message-service:/app
+      - /app/node_modules
+      - ./shared:/app/shared
+    ports:
+      - "3003:3003"
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.22
+    depends_on:
+      postgres:
+        condition: service_healthy
+      auth-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx 反向代理
+  nginx:
+    image: nginx:alpine
+    container_name: secure_chat_nginx
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./client/dist:/usr/share/nginx/html:ro
+      - nginx_logs:/var/log/nginx
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.30
+    depends_on:
+      - auth-service
+      - kacls-service
+      - message-service
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # 監控和日誌收集 (可選)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: secure_chat_prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      secure_chat_network:
+        ipv4_address: 172.20.0.40
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  kacls_keys:
+    driver: local
+  nginx_logs:
+    driver: local
+  prometheus_data:
+    driver: local
